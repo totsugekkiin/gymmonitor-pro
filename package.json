@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --port=5173 --host=0.0.0.0",
-    "build": "vite build",
+    "build": "vite build --base /gymmonitor-pro/",
+    "build:esp": "vite build --base ./ && powershell -NoProfile -Command \"Get-ChildItem 'arduino/gym-tracker-wifi/data' -Exclude '.gitkeep' | Remove-Item -Recurse -Force; Copy-Item -Path 'dist/*' -Destination 'arduino/gym-tracker-wifi/data' -Recurse -Force\"",
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"

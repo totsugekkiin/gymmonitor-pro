@@ -10,7 +10,17 @@
 2. 启动开发服务器：`npm run dev`
 3. 在浏览器中打开终端显示的本地地址（默认 `http://localhost:5173`）
 
-**说明：** 需使用支持 [Web Bluetooth API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Bluetooth_API) 的浏览器（如 Chrome、Edge），并通过 HTTPS 或 `localhost` 访问。
+**说明（网页蓝牙 / GitHub Pages）：** 需 Chrome/Edge 等支持 Web Bluetooth 的浏览器。
+
+## 安卓推荐：ESP WiFi + 自带浏览器
+
+无需安装 Chrome。详见 [`arduino/README.md`](arduino/README.md)。
+
+1. 按 Arduino 说明烧录固件并上传 `data/` 网页  
+2. 手机连接 WiFi **`Gym-Tracker`**（密码 `12345678`）  
+3. 浏览器打开 **http://192.168.4.1**
+
+构建 ESP 用网页：`npm run build:esp`
 
 ## 构建
 

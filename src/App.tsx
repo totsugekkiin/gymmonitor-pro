@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AnimatePresence } from 'motion/react';
-import { Activity, Bluetooth, Plus } from 'lucide-react';
+import { Activity, Plus, Wifi } from 'lucide-react';
 import { LiveHud } from './components/LiveHud';
 import { SetTable } from './components/SetTable';
 import { SetSummaryCard } from './components/SetSummaryCard';
 import { ReviewPage } from './components/ReviewPage';
 import { useWorkoutSession } from './hooks/useWorkoutSession';
-import { useBluetooth } from './hooks/useBluetooth';
+import { useWifi } from './hooks/useWifi';
 
 type AppMode = 'live' | 'review';
 
@@ -38,7 +38,7 @@ export default function App() {
   } = useWorkoutSession();
 
   const { live, isConnected, error, connect, sendCommand, registerTelemetryHandler } =
-    useBluetooth();
+    useWifi();
 
   useEffect(() => {
     registerTelemetryHandler((data) => {
@@ -84,7 +84,7 @@ export default function App() {
         await sendCommand('RESET');
         await new Promise((r) => setTimeout(r, 150));
       } catch {
-        alert('无法发送 RESET，请重新连接蓝牙');
+        alert('无法发送 RESET，请重新连接设备');
         return;
       }
       startSet(setId, 0);
@@ -156,9 +156,9 @@ export default function App() {
             className={`w-10 h-10 rounded-full flex items-center justify-center transition-all ${
               isConnected ? 'bg-ios-blue/20 text-ios-blue' : 'bg-white/5 text-white/20'
             }`}
-            aria-label="连接蓝牙"
+            aria-label="连接设备"
           >
-            <Bluetooth size={20} className={isConnected ? 'animate-pulse' : ''} />
+            <Wifi size={20} className={isConnected ? 'animate-pulse' : ''} />
           </button>
           {phase === 'in_session' ? (
             <button
@@ -189,14 +189,14 @@ export default function App() {
           <div className="ios-glass p-8 text-center space-y-4 mt-8">
             <h2 className="text-xl font-bold">GymMonitor Pro</h2>
             <p className="text-sm text-ios-gray leading-relaxed">
-              连接杠铃上的传感器，开始训练后记录每一组，练完可回放查看倾斜与深度。
+              手机连接 WiFi「Gym-Tracker」后打开本页，开始训练并记录每一组，练完可回放查看倾斜与深度。
             </p>
             <button
               type="button"
               onClick={() => connect()}
               className="text-sm text-ios-blue font-semibold"
             >
-              {isConnected ? '蓝牙已连接' : '先连接蓝牙设备'}
+              {isConnected ? '设备已连接' : '连接传感器'}
             </button>
           </div>
         )}
