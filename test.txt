@@ -1,0 +1,333 @@
+#include <Wire.h>
+#include <MPU6050_tockn.h>
+#include <Adafruit_VL53L1X.h>
+#include <U8g2lib.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <math.h>
+
+// ========== ESP32-C3 SuperMini 引脚 ==========
+#define TRIG_PIN 2
+#define ECHO_PIN 3
+#define SDA_PIN 8
+#define SCL_PIN 9
+#define BUZZER_PIN 10
+
+// ========== 蓝牙 NUS UUID ==========
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+// ========== 阈值（可按架子/身高在串口或以后 BLE 调） ==========
+#define TILT_LIMIT_DEG    10.0f
+#define DEPTH_BOTTOM_CM   5
+#define DEPTH_TOP_CM      30
+#define LOOP_DELAY_MS     20
+#define TILT_BEEP_INTERVAL_MS 800
+#define TILT_BEEP_DURATION_MS 80
+#define ANGLE_LPF_ALPHA   0.85f   // 越大越平滑、越慢
+
+// ========== 对象 ==========
+MPU6050 mpu(Wire);
+Adafruit_VL53L1X vl53(-1, -1);
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+BLEServer *pServer = NULL;
+BLECharacteristic *pTxCharacteristic = NULL;
+bool deviceConnected = false;
+
+enum SystemState { SYS_STARTING, SYS_RUNNING };
+SystemState currentState = SYS_STARTING;
+unsigned long startDelayTimer = 0;
+
+enum RepState { WAIT_DOWN, WAIT_UP };
+RepState repState = WAIT_DOWN;
+int totalReps = 0;
+bool repEventThisFrame = false;  // 本帧是否刚完成一次
+
+float tiltFiltered = 0.0f;
+bool tiltWarning = false;
+
+unsigned long lastBuzzerMillis = 0;
+bool buzzerActive = false;
+unsigned long buzzerDuration = 0;
+unsigned long lastTiltBeepMs = 0;
+
+int lastLaserDist = -1;
+const char *currentDataSource = "NONE";
+
+// ========== 蜂鸣器 ==========
+void triggerBuzzer(unsigned long duration) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  lastBuzzerMillis = millis();
+  buzzerDuration = duration;
+  buzzerActive = true;
+}
+
+void updateBuzzer() {
+  if (buzzerActive && (millis() - lastBuzzerMillis >= buzzerDuration)) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerActive = false;
+  }
+}
+
+void updateTiltBuzzer() {
+  if (!tiltWarning) return;
+  unsigned long now = millis();
+  if (now - lastTiltBeepMs >= TILT_BEEP_INTERVAL_MS) {
+    triggerBuzzer(TILT_BEEP_DURATION_MS);
+    lastTiltBeepMs = now;
+  }
+}
+
+// ========== OLED ==========
+void updateOLED(const char *topText, const char *bigNumber, const char *subText) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.drawStr(0, 10, topText);
+  u8g2.drawHLine(0, 14, 128);
+  u8g2.setFont(u8g2_font_logisoso32_tn);
+  u8g2.drawStr(36, 50, bigNumber);
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.drawStr(0, 62, subText);
+  u8g2.sendBuffer();
+}
+
+void drawTiltScreen(float angle, int dist, int reps) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.drawStr(0, 10, "!! TILT WARNING !!");
+  u8g2.drawHLine(0, 14, 128);
+  u8g2.setFont(u8g2_font_logisoso32_tn);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d", reps);
+  u8g2.drawStr(36, 50, buf);
+  u8g2.setFont(u8g2_font_6x12_tf);
+  char sub[32];
+  snprintf(sub, sizeof(sub), "A:%.0f  D:%dcm", fabs(angle), dist);
+  u8g2.drawStr(0, 62, sub);
+  u8g2.sendBuffer();
+}
+
+void drawNormalScreen(int dist, int reps) {
+  const char *top = deviceConnected ? "ONLINE" : "OFFLINE";
+  char big[8];
+  snprintf(big, sizeof(big), "%02d", reps % 100);  // 屏显两位，不回绕 total
+  char sub[32];
+  snprintf(sub, sizeof(sub), "%s %dCM", currentDataSource, dist);
+  updateOLED(top, big, sub);
+}
+
+// ========== 超声波（中值滤波） ==========
+int getFilteredUltrasonic() {
+  int samples[5];
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+    long duration = pulseIn(ECHO_PIN, HIGH, 15000);
+    int cm = duration * 0.034 / 2;
+    samples[i] = (cm == 0 || cm > 150) ? 150 : cm;
+    delay(5);
+  }
+  for (int i = 0; i < 4; i++) {
+    for (int j = i + 1; j < 5; j++) {
+      if (samples[i] > samples[j]) {
+        int t = samples[i];
+        samples[i] = samples[j];
+        samples[j] = t;
+      }
+    }
+  }
+  return samples[2];
+}
+
+// ========== 距离融合 ==========
+int getFusedDistance() {
+  int laserDist = -1;
+  if (vl53.dataReady()) {
+    int16_t distance_mm = vl53.distance();
+    vl53.clearInterrupt();
+    if (distance_mm != -1) {
+      laserDist = distance_mm / 10;
+      lastLaserDist = laserDist;
+    }
+  } else if (lastLaserDist > 0) {
+    laserDist = lastLaserDist;
+  }
+
+  if (laserDist > 0 && laserDist <= 120) {
+    currentDataSource = "LASER";
+    return laserDist;
+  }
+  currentDataSource = "ULTRA";
+  return getFilteredUltrasonic();
+}
+
+// ========== 读倾斜角（低通；不对就改 getAngleY） ==========
+float readTiltAngle() {
+  float raw = mpu.getAngleX();
+  tiltFiltered = ANGLE_LPF_ALPHA * tiltFiltered + (1.0f - ANGLE_LPF_ALPHA) * raw;
+  return tiltFiltered;
+}
+
+// ========== 计次状态机（与倾斜无关） ==========
+void updateRepCounter(int currentDist) {
+  repEventThisFrame = false;
+
+  if (repState == WAIT_DOWN) {
+    if (currentDist <= DEPTH_BOTTOM_CM) {
+      repState = WAIT_UP;
+      triggerBuzzer(50);
+    }
+  } else if (repState == WAIT_UP) {
+    if (currentDist >= DEPTH_TOP_CM) {
+      repState = WAIT_DOWN;
+      if (totalReps < 999) {
+        totalReps++;
+      }
+      repEventThisFrame = true;
+      triggerBuzzer(150);
+    }
+  }
+}
+
+// ========== BLE 发送 ==========
+// 格式: D,A,R,W,T,E  — 旧网页只解析 D,A,R 即可
+void sendTelemetry(int dist, float angle, int reps) {
+  if (!deviceConnected || pTxCharacteristic == NULL) return;
+
+  tiltWarning = (fabs(angle) > TILT_LIMIT_DEG);
+  int w = tiltWarning ? 1 : 0;
+  int e = repEventThisFrame ? 1 : 0;
+
+  char buf[80];
+  snprintf(buf, sizeof(buf), "D:%d,A:%.1f,R:%d,W:%d,T:%lu,E:%d\n",
+           dist, angle, reps, w, (unsigned long)millis(), e);
+  pTxCharacteristic->setValue((uint8_t *)buf, strlen(buf));
+  pTxCharacteristic->notify();
+}
+
+// ========== BLE RX ==========
+class MyCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    std::string rx = pCharacteristic->getValue();
+    if (rx.empty()) return;
+
+    String cmd = String(rx.c_str());
+    cmd.trim();
+
+    if (cmd == "RESET") {
+      totalReps = 0;
+      repState = WAIT_DOWN;
+      repEventThisFrame = false;
+      triggerBuzzer(300);
+      Serial.println("[BLE] RESET");
+    } else if (cmd == "CAL") {
+      Serial.println("[BLE] CAL start - keep still");
+      mpu.calcGyroOffsets(true);
+      tiltFiltered = 0;
+      triggerBuzzer(500);
+      Serial.println("[BLE] CAL done");
+    }
+  }
+};
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) {
+    deviceConnected = true;
+    Serial.println("[BLE] connected");
+  }
+  void onDisconnect(BLEServer *pServer) {
+    deviceConnected = false;
+    Serial.println("[BLE] disconnected");
+    pServer->startAdvertising();
+  }
+};
+
+// ========== setup ==========
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  u8g2.begin();
+  updateOLED("PREPARING", "00", "INIT...");
+
+  mpu.begin();
+  Serial.println("MPU calibrating - keep still");
+  mpu.calcGyroOffsets(true);
+  tiltFiltered = mpu.getAngleX();
+
+  if (!vl53.begin(0x29, &Wire)) {
+    Serial.println("VL53L1X fail - ultra only");
+  } else {
+    vl53.startRanging();
+  }
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  BLEDevice::init("Gym-Tracker");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pTxCharacteristic = pService->createCharacteristic(
+      CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY);
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  BLECharacteristic *pRx = pService->createCharacteristic(
+      CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE);
+  pRx->setCallbacks(new MyCallbacks());
+
+  pService->start();
+  pServer->getAdvertising()->start();
+
+  triggerBuzzer(200);
+  startDelayTimer = millis();
+  Serial.println("Gym-Tracker ready");
+}
+
+// ========== loop ==========
+void loop() {
+  updateBuzzer();
+
+  int currentDist = getFusedDistance();
+  mpu.update();
+  float tiltAngle = readTiltAngle();
+
+  if (currentState == SYS_STARTING) {
+    if (millis() - startDelayTimer >= 1000) {
+      currentState = SYS_RUNNING;
+      triggerBuzzer(500);
+    }
+    delay(LOOP_DELAY_MS);
+    return;
+  }
+
+  // 1) 计次（始终）
+  updateRepCounter(currentDist);
+
+  // 2) 显示
+  tiltWarning = (fabs(tiltAngle) > TILT_LIMIT_DEG);
+  if (tiltWarning) {
+    drawTiltScreen(tiltAngle, currentDist, totalReps);
+    updateTiltBuzzer();
+  } else {
+    if (!buzzerActive) {
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+    drawNormalScreen(currentDist, totalReps);
+  }
+
+  // 3) BLE（始终，与倾斜无关）
+  sendTelemetry(currentDist, tiltAngle, totalReps);
+
+  delay(LOOP_DELAY_MS);
+}
