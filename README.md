@@ -19,6 +19,14 @@ npm run build
 npm run preview
 ```
 
+## 在线访问（GitHub Pages）
+
+推送到 `master` 后会自动部署：
+
+**https://totsugekkiin.github.io/gymmonitor-pro/**
+
+首次使用请在仓库 **Settings → Pages → Build and deployment** 中将 Source 设为 **GitHub Actions**。
+
 ---
 
 # GymMonitor Pro (English)
@@ -41,3 +49,9 @@ Real-time barbell telemetry over Web Bluetooth: depth, tilt angle, and per-set w
 npm run build
 npm run preview
 ```
+
+## Live demo (GitHub Pages)
+
+**https://totsugekkiin.github.io/gymmonitor-pro/**
+
+Auto-deploys on push to `master` (requires Pages source: GitHub Actions).
